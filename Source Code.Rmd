@@ -1,0 +1,380 @@
+---
+title: "Project Big Data"
+output: html_notebook
+---
+
+Prediksi  Pengunduran Diri Karyawan Perusahaan "C" Menggunakan
+Random Forest
+
+Kelompok :
+
+Daniel Dwi Eryanto Manurung      1810511035
+Fachran Sandi                    1810511049
+Hashfi Ashfahan                  1810511056
+Fajar Akbardipura                1810511057
+
+# Masuk ke sesi kodingan
+Menginput Library yang digunakan
+```{r}
+library(tidyverse) # Data Wrangling
+library(lubridate) # Date type data
+library(ggplot2) # Data Visualization
+library(plotly) # Interactive data visualization
+library(FactoMineR) # PCA
+library(factoextra) # PCA Visualization
+library(tidytext) # additional data wrangling
+library(rsample) # data sampling
+library(caret) # ML modeling
+library(tidymodels) # ML modeling
+library(ranger) # Random Forest
+library(lime) # LIME
+```
+
+Baca dataset
+```{r}
+data_hrd <- read.table("data_input/HR DATA.txt",sep = "\t",header = T,fill = T)
+head(data_hrd)
+```
+
+Lihat apakah ada data yang duplikat di Employee_Name
+```{r}
+data_hrd[duplicated(data_hrd$Employee_Name),]
+```
+
+Menampilkan data yang duplikat di Employee_Name
+```{r}
+data_hrd %>% 
+   filter(Employee_Name %in% data_hrd[duplicated(data_hrd$Employee_Name),"Employee_Name"])
+```
+
+Mengubah data di Employee_Name dengan menambahkan "2" diakhir
+```{r}
+data_hrd[duplicated(data_hrd$Employee_Name),]$Employee_Name <- paste(data_hrd[duplicated(data_hrd$Employee_Name),]$Employee_Name,"2",sep = "")
+
+data_hrd[duplicated(data_hrd$Employee_Name),]
+```
+
+Select atribut yang akan digunakan
+```{r}
+data_hrd <- data_hrd %>% 
+  select(-c(EmpID,Zip,MarriedID,EmpID,MaritalStatusID,GenderID,EmpStatusID,
+            DeptID,PerfScoreID,ManagerID,Original.DS,PositionID,DaysLateLast30))
+
+head(data_hrd)
+```
+
+Mengubah tipe data pada atribut yang berisi tanggal menjadi date dan terdapat broken pada DOB
+```{r}
+data_hrd <- data_hrd %>% 
+   mutate(DOB = dmy(DOB),
+          DateofHire = dmy(DateofHire),
+          DateofTermination = dmy(DateofTermination),
+          LastPerformanceReview_Date = dmy(LastPerformanceReview_Date),
+          FromDiversityJobFairID = as.factor(FromDiversityJobFairID),
+          Termd = as.factor(Termd)) %>% 
+   mutate_if(is.character, as.factor) %>% 
+   mutate(Employee_Name = as.character(Employee_Name))
+
+head(data_hrd)
+```
+
+Melakukan proses pemisahkan string pada DOB menjadi day, month, year, year_new untuk mengatasi broken tersebut
+```{r}
+dob <- read.table("data_input/HR DATA.txt",sep = "\t",header = T,fill = T)
+dob <- strsplit(dob$DOB,split = "-") 
+
+dob <- data.frame(matrix(unlist(dob), nrow=length(dob), byrow=T)) %>% 
+  setNames(c("day","month","year")) %>% 
+  mutate(year_new = paste("19",year,sep = ""))
+
+head(dob)
+```
+
+Menggabungkan atribut day, month, year_new menjadi satu atribut DOB
+```{r}
+data_hrd <- data_hrd %>% 
+   mutate(DOB = paste(dob$day,dob$month,dob$year_new,sep = "-"),
+          DOB = dmy(DOB))
+
+head(data_hrd)
+```
+
+Mengecek data Na pada dataset
+```{r}
+colSums(is.na(data_hrd))
+```
+
+Mengisi value pada Na dengan "2020-01-01" pada DateofTermination dan LastPerformanceReview_Date
+```{r}
+recent <- as.Date("2020-01-01")
+
+data_hrd <- data_hrd %>%
+   mutate(DateofTermination = replace_na(data_hrd$DateofTermination,recent),
+          LastPerformanceReview_Date = replace_na(data_hrd$LastPerformanceReview_Date,recent))
+
+head(data_hrd)
+```
+
+Mengecek Na kembali
+```{r}
+colSums(is.na(data_hrd))
+```
+
+Untuk melihat siapa saja yang memiliki nilai NA jika EngagementSurvery dipilih
+```{r}
+data_hrd %>% 
+   filter(is.na(EngagementSurvey))
+```
+
+Menghapus yang memiliki nilai missing value/NA
+```{r}
+data_clean <- data_hrd %>% 
+   filter(!is.na(EngagementSurvey))
+
+colSums(is.na(data_clean))
+```
+
+Tahapan Feature Engineering
+Untuk lihat udah berapa hari setelah review performa karyawan dan lihat udah berapa lama dia kerja di perusahaan
+```{r}
+data_clean <- data_clean %>% 
+  mutate(age = as.numeric(round((DateofHire - DOB)/365)),
+         DayAfterReview = as.numeric(round(recent - LastPerformanceReview_Date)),
+         WorkingDay = ifelse(Termd == 0,
+                             as.numeric(round(recent - DateofHire)),
+                             as.numeric(round(DateofTermination - DateofHire))))
+head(data_clean)
+```
+
+# Visualiasi
+Lihat apakah ada outlier 
+```{r}
+data_clean %>% 
+   select_if(is.numeric) %>% 
+   pivot_longer(cols = c(names(.))) %>% 
+   ggplot(aes(y = value)) +
+   geom_boxplot(aes(fill = name),show.legend = F) +
+   scale_fill_brewer(palette = "RdGy") +
+   facet_wrap(~name,scales = "free_y") +
+   theme_minimal()
+```
+
+
+Pembuatan PCA
+```{r}
+factor <- which(sapply(data_clean, is.factor))
+
+pca <- PCA(data_clean %>% `rownames<-`(data_clean$Employee_Name),
+           quali.sup = c(1,7,13,14,24,26,factor),scale.unit = T,graph = F)
+summary(pca)
+```
+
+Visual Bigplot
+```{r,fig.width=7,fig.height=6}
+options(ggrepel.max.overlaps = Inf) 
+plot.PCA(pca,choix = "ind",invisible = "quali",select = "contrib10",habillage = 4)
+```
+
+Visual plot berdasarkan variabel
+```{r}
+plot.PCA(pca,choix = "var")
+```
+
+Check Chi-Square
+```{r}
+chisq.test(data_clean$ManagerName,data_clean$PerformanceScore)
+```
+
+Visualisasi Performa Karyawan Berdasarkan Manajer sesuai frekuensi
+```{r,fig.width=8,fig.height=7}
+data_clean <- data_clean %>% 
+   droplevels()
+
+table(data_clean$ManagerName,data_clean$PerformanceScore) %>% 
+   as.data.frame() %>% 
+   mutate(Var1 = reorder_within(Var1,by = Freq,within = Var2)) %>% 
+   ggplot(aes(x = Freq, y = Var1)) +
+   geom_col(aes(fill = Var2)) +
+   scale_fill_brewer(palette = "RdGy") +
+   facet_wrap(~Var2,scales = "free") +
+   scale_y_reordered() +
+   labs(title = "Performa Karyawan sesuai Manajer",
+        subtitle = "Manajer yang mempunya karyawan terbaik ?",
+        x = "Frekuensi", y = "Nama Manajer") +
+   theme_minimal() +
+   theme(legend.position = "none")
+```
+
+Melihat berapa banyak karyawan pada masing-masing manager
+```{r}
+data_clean %>% 
+   group_by(ManagerName) %>% 
+   count() %>% 
+   arrange(-n)
+```
+
+Melihat persentase pada masing-masing manager pada perc_exceed dan perc_pip
+```{r}
+manager_perf <- table(data_clean$ManagerName,data_clean$PerformanceScore) %>% 
+  as.data.frame() %>% 
+  pivot_wider(names_from = "Var2",values_from = "Freq") %>% 
+  mutate(perc_exceed = round( Exceeds / (Exceeds + `Fully Meets` + `Needs Improvement` + PIP),3),
+         perc_pip = round(PIP/ (Exceeds + `Fully Meets` + `Needs Improvement` + PIP),3))
+
+manager_perf
+```
+
+visualisasi performa terbaik berdasarkan frekuensi dan Persentase
+```{r}
+manager_perf %>% 
+   select(c(Var1,Exceeds,perc_exceed)) %>% 
+   pivot_longer(cols = c(Exceeds,perc_exceed)) %>% 
+   ggplot(aes(x = value, y = reorder(Var1,value))) +
+   geom_col(aes(fill = name),show.legend = F) +
+   scale_fill_manual(values = c("#bf0808","#3b3b3b")) +
+   facet_wrap(~name,scales = "free_x") +
+   labs(title = "Performa Karyawan Terbaik sesuai Manajer",
+        subtitle = "Frekuensi dan Persentase",
+        x = "Value", y = "Nama Manajer") +
+   theme_minimal()
+```
+
+visualisasi performa terburuk berdasarkan frekuensi dan Persentase
+```{r}
+manager_perf %>% 
+   select(c(Var1,PIP,perc_pip)) %>% 
+   pivot_longer(cols = c(PIP,perc_pip)) %>% 
+   ggplot(aes(x = value, y = reorder(Var1,value))) +
+   geom_col(aes(fill = name),show.legend = F) +
+   scale_fill_manual(values = c("#bf0808","#3b3b3b")) +
+   facet_wrap(~name,scales = "free_x") +
+   labs(title = "Performa Karyawan Terburuk sesuai Manajer",
+        subtitle = "Frekuensi dan Persentase",
+        x = "Value", y = "Nama Manajer") +
+   theme_minimal()
+```
+
+Melihat apakah PayRate setiap departemen sama rata atau apakah terdapat ketimpangan
+```{r}
+data_clean %>% 
+  group_by(Department) %>% 
+  summarise(avg_PayRate = mean(PayRate),
+            median_PayRate = median(PayRate),
+            min_PayRate = min(PayRate),
+            max_PayRate = max(PayRate)) %>% 
+   arrange(-median_PayRate)
+```
+
+Melihat korelasi antara PayRate dan WorkingDay
+```{r}
+data_clean %>% 
+   filter(Termd == 0) %>% 
+   select(PayRate,Department,WorkingDay) %>% 
+   ggplot(aes(x = WorkingDay, y = PayRate)) +
+   geom_point(aes(col = WorkingDay),show.legend = F) +
+   scale_color_continuous(low = "#3b3b3b",high = "#bf0808") +
+   facet_wrap(~Department) +
+   labs(title = "Korelasi PayRate dan WorkingDay",
+        subtitle = "oleh setiap departemen") +
+   theme_minimal()
+```
+
+Melihat korelasi setiap variabel numerik
+```{r}
+GGally::ggcorr(data_clean %>% 
+                 select_if(is.numeric),label = T,legend.position = "none")
+```
+
+Check Korelasi Pearson antara PayRate dan SpecialProjectsCount
+```{r}
+cor.test(data_clean$PayRate,data_clean$SpecialProjectsCount)
+```
+
+Melihat total jumlah dan rata-rata SpecialProjectCount pada setiap Departemen
+```{r}
+data_clean %>% 
+  group_by(Department) %>% 
+  summarise(total = sum(SpecialProjectsCount),
+            avg = mean(SpecialProjectsCount)) %>% 
+   arrange(-avg)
+```
+
+Tidak semua variabel bersifat penting untuk pemodelan sehingga kita harus melakukan penghapusan terhadap variabel yang bervarian rendah. Data bervarians rendah buruk untuk model karena tidak banyak informasi yang dapat dipelajari oleh model.
+```{r}
+zero_var <- nearZeroVar(data_clean)
+zero_var
+```
+
+```{r}
+data_mod <- data_clean[,-zero_var]
+head(data_mod)
+```
+
+Setelah dilihat lagi, data tersebut masih memiliki informasi redundan. Kemudian akan dihapus bersamaan dengan variabel date dan id
+```{r}
+data_mod <- data_mod %>% 
+   select(-c(Employee_Name,DOB,DateofHire,TermReason,EmploymentStatus,WorkingDay))
+
+head(data_mod)
+```
+
+# Data Split
+```{r}
+prop.table(table(data_mod$Termd))
+```
+
+```{r}
+set.seed(123)
+splitter <- initial_split(data_mod,prop = 0.8,strata = "Termd")
+train <- training(splitter)
+test <- testing(splitter)
+```
+
+Lihat apakah data sudah balance atau belum
+```{r}
+prop.table(table(train$Termd))
+```
+
+Mengatasi Imbalanced Data dengan Down Sampling
+```{r}
+train_down <- downSample(train %>% select(-Termd), train$Termd)
+train_down <- train_down %>% 
+   rename("Termd" = "Class") %>% 
+   droplevels()
+prop.table(table(train_down$Termd))
+```
+
+# Modelling
+```{r}
+mod_rf <- rand_forest(mode = "classification") %>% 
+  set_engine("ranger") %>% 
+  fit(Termd ~., data = train_down)
+```
+
+```{r}
+pred_rf <- predict(mod_rf,test,type = "prob")
+pred_rf_class <- as.factor(ifelse(pred_rf$.pred_0 >0.5, 0,1))
+
+conf_rf <- confusionMatrix(pred_rf_class,test$Termd,positive = "0")
+conf_rf
+```
+
+Interpretasi dengan LIME
+```{r}
+set.seed(123)
+explainer <- lime(x = train_down %>% select(-Termd),model = mod_rf)
+```
+
+# Hasi prediksi LIME
+```{r,fig.width=8,fig.height=7}
+set.seed(123)
+explanation <- explain(x = test %>% select(-Termd) %>% dplyr::slice(1:2),
+                       labels = "0",
+                       n_permutations = 500,
+                       dist_fun = "manhattan",
+                       explainer = explainer, 
+                       kernel_width = 3,
+                       n_features = 10)
+
+plot_features(explanation,ncol = 1)
+```
